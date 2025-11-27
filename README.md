@@ -319,7 +319,3 @@ This project is part of the 42 School curriculum.
 - [Bash Reference Manual](https://www.gnu.org/software/bash/manual/bash.html)
 
 ---
-
-<p align="center">
-  Made with ❤️ at 42 School
-</p>
