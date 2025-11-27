@@ -301,8 +301,8 @@ minishell/
 
 | Author | GitHub |
 |--------|--------|
-| **Hugo Claude** | [@h-claude](https://github.com/h-claude) |
-| **Mohamed Ajili** | [@moajili](https://github.com/moajili) |
+| **Hippolyte Claude** | [@h-claude](https://github.com/h-claude) |
+| **Mohamed Ali Ajili** | [@moajili](https://github.com/ajilidali) |
 
 ---
 
