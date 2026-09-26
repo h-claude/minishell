@@ -1,321 +1,120 @@
-# 🐚 Minishell
+# minishell
 
-A simple, lightweight Unix shell implementation written in C. This project recreates basic functionality of bash, featuring command parsing, execution, pipes, redirections, and built-in commands.
-
-> A 42 School project focused on learning Unix process management, signal handling, and building a functional command-line interpreter.
+> A POSIX-subset command interpreter written in C: lexes, parses into an AST, and executes pipelines of external and built-in commands with I/O redirection, heredocs, and signal-aware job control.
 
 ---
 
-## 📋 Table of Contents
+## 📌 Problem Overview & Classification
 
-- [About](#about)
-- [Technologies](#technologies)
-- [Features](#features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Built-in Commands](#built-in-commands)
-- [Project Structure](#project-structure)
-- [Authors](#authors)
-
----
-
-## 📖 About
-
-Minishell is a minimal shell implementation that mimics the behavior of bash. It provides an interactive command-line interface where users can execute commands, navigate directories, manage environment variables, and chain commands using pipes and redirections.
-
-This project demonstrates understanding of:
-- Process creation and management (fork, exec, wait)
-- File descriptors and I/O redirection
-- Signal handling (SIGINT, SIGQUIT)
-- Lexical analysis and parsing (Abstract Syntax Tree)
-- Memory management with custom garbage collector
+- **Domain / Problem Category:** Low-Level Systems Programming / Unix Process & Inter-Process Communication (IPC)
+- **Theoretical Problem:** Shell Grammar Interpretation (Lexer → Recursive-Descent Parser → AST evaluator), combined with the classic *fork/exec/wait* process-control model and a *pipe-based Producer-Consumer* pattern for heredocs and multi-stage pipelines.
+- **Core Objective:** Translate a raw input line into an executable process graph — a linked chain of `fork`ed processes connected by anonymous pipes, each with its file descriptors correctly redirected — while keeping built-in commands (which must mutate the parent's own environment/cwd) running in-process.
+- **Key Constraints & Challenges:**
+  - Correct file-descriptor bookkeeping across N-stage pipelines (no leaked read/write ends, no double-close).
+  - Distinguishing commands that must run in the parent (`cd`, `export`, `unset`, `exit`, …) from those that require `fork`+`execve`.
+  - Heredoc (`<<`) input must be collected in a child process so `SIGINT` during collection doesn't kill the shell, while still feeding the result back through a `pipe(2)`.
+  - Signal behavior differs by context: interactive prompt (`SIGINT` redraws the line), heredoc collection (`SIGINT` aborts the heredoc only), and executing children (`SIGINT`/`SIGQUIT` reset to `SIG_DFL`).
+  - Deterministic memory/FD cleanup on every exit path (`exit` builtin, `Ctrl-D`, fatal error) via a single garbage-collector-backed `ft_exit`.
 
 ---
 
-## 🛠️ Technologies
+## ⚙️ Architecture & Implementation Details
 
-| Technology | Description |
-|------------|-------------|
-| ![C](https://img.shields.io/badge/C-00599C?style=flat&logo=c&logoColor=white) **C Language** | Core programming language (C99 standard) |
-| ![Make](https://img.shields.io/badge/Make-427819?style=flat&logo=gnu&logoColor=white) **GNU Make** | Build automation tool |
-| ![Readline](https://img.shields.io/badge/GNU_Readline-4EAA25?style=flat&logo=gnu&logoColor=white) **GNU Readline** | Command-line editing and history |
-| ![Termcap](https://img.shields.io/badge/Termcap-333333?style=flat&logoColor=white) **Termcap** | Terminal capability library |
+- **Modular Design:**
+  - `srcs/parsing/` — `lexer.c` / `lexer_utils.c` tokenize the input line into `TOKEN_WORD`, `TOKEN_VARIABLE`, `TOKEN_PIPE`, `TOKEN_OPERATOR`, `TOKEN_STRING`, `TOKEN_EMPTY`, `TOKEN_EOF` (`t_token`, `t_lexer` in [minishell.h](includes/minishell.h)). `parser.c` / `parsecmd.c` implement a recursive-descent parser (`parse_pipeline` → `parse_command`) producing a `t_astnode` tree of type `AST_COMMAND`, `AST_PIPELINE`, or `AST_ERR`. `vars.c` handles `$VAR` / `$?` expansion (`replace_variables`, `parse_variable`).
+  - `srcs/execution/` — `exec.c` walks the AST: single commands call `is_local_fct` (builtin dispatch) or `fork`+`execve`; `redirect.c` resolves `<`, `>`, `>>`, `<<` into real file descriptors per node before execution.
+  - `srcs/execution/exec_pipe/` — for `AST_PIPELINE` nodes, `ast_to_list.c` flattens the (left-associative) pipe tree into a `t_lst_cmd` linked list, `exec_pipe.c` forks one process per stage wiring `pipe(2)` fds between consecutive commands, `manage_pid.c` tracks/reaps every spawned PID.
+  - `srcs/builtins/` — one file per built-in (`cd/`, `echo.c`, `env.c`, `exit.c`, `export.c`, `pwd.c`, `unset.c`), each operating directly on the shell's live `t_env` list so state (cwd, exported variables) persists across commands.
+  - `srcs/utils/` — `signals.c` (signal handlers per shell mode), `copy_env.c` / `utils2.c` (the `t_env` singly-linked list, exposed process-wide through the `give_envp`/`give_mini` static-pointer accessors), `print_errors.c` (centralized bash-style diagnostics).
+  - `libft/` — a from-scratch libc subset plus `garbage_collector/`, a reference-less allocation tracker (`t_gc` linked list) used by every heap allocation in the project.
 
-### Libraries Used
+- **Key Primitives & Mechanisms:**
+  - `fork` / `execve` / `waitpid`: one child per pipeline stage ([exec.c](srcs/execution/exec.c), [exec_pipe.c](srcs/execution/exec_pipe/exec_pipe.c)); exit status extracted via `WEXITSTATUS`/`WTERMSIG`.
+  - `pipe(2)` + `dup2(2)`: connects pipeline stages and implements heredocs — `<<` forks a dedicated collector process that writes each `readline`-free line (via `get_next_line`) into the write end, and the consumer `dup`s the read end onto its `fd_in`.
+  - `sigaction` / `signal`: three distinct handler sets swapped in via `setup_signal_handler(flag)` — interactive prompt (`handler`, redraws the readline buffer on `SIGINT`), heredoc collection (`handle_sigint_heredoc`), and executing-child mode where both signals are restored to `SIG_DFL` right before `execve`.
+  - `access(X_OK)` + custom `find_path`: resolves absolute/relative paths directly, otherwise walks `$PATH` entries manually before falling back to `ER_CMD_NOT_FOUND` (exit 127) / `ER_PERM_DENIED` (exit 126), matching bash's own exit-code convention.
+  - `open(2)` with `O_WRONLY|O_CREAT|O_TRUNC` (`>`) or `O_APPEND` (`>>`), `O_RDONLY` (`<`): redirections are resolved into `node->fd_in`/`fd_out` before the fork, and the parent's original stdio is preserved via `dup(STDIN_FILENO)`/`dup(STDOUT_FILENO)` and restored after the command completes.
+  - `getcwd` / `chdir`: back `cd`, `cd -` (via a synthetic `OLDPWD`/`PWD` pair kept in the env list) and the dynamic prompt (`make_prompt` reads a hidden `PWD_HIDE` env entry).
 
-- **libft** - Custom implementation of standard C library functions
-  - String manipulation functions (ft_strlen, ft_strdup, ft_split, etc.)
-  - Memory management functions (ft_calloc, ft_bzero, ft_memcpy, etc.)
-  - Linked list operations (ft_lstadd_back, ft_lstnew, etc.)
-  - Custom garbage collector for automatic memory management
-  - get_next_line for reading file descriptors
-
-- **readline** - GNU library for command-line input
-  - Line editing capabilities
-  - Command history with arrow key navigation
-  - Custom prompt display
-
-- **termcap** - Terminal capability database
-  - Terminal-independent screen handling
-
-### Compiler & Flags
-
-```
-Compiler: cc (gcc/clang)
-Flags: -Wall -Wextra -Werror -g3
-```
+- **Lifecycle & Resource Management:** All heap allocations go through `ft_malloc`, registered in a process-global `t_gc` list ([garbage_collector.c](libft/garbage_collector/garbage_collector.c)); `ft_free` detaches and frees a single node, `ft_free_gb` walks and frees the whole list. Every exit path — the `exit` builtin, `Ctrl-D` (`EOF` from `readline`), and fatal internal errors — funnels through `ft_exit(status)` ([call_functions.c](libft/garbage_collector/call_functions.c)), which frees the garbage-collector list, `close`s file descriptors `0..1023`, then calls `exit(status)`, guaranteeing no dangling FDs or unfreed tracked allocations regardless of exit reason. Per-command redirections save/restore the shell's own stdin/stdout with `dup`/`dup2` so a redirection on one command never leaks into the next.
 
 ---
 
-## ✨ Features
+## 🛠️ Stack & Tooling
 
-### Shell Features
-- ✅ Interactive command prompt with custom display
-- ✅ Command history (up/down arrows)
-- ✅ Signal handling (Ctrl+C, Ctrl+D, Ctrl+\)
-- ✅ Exit status codes ($?)
-- ✅ Environment variable expansion ($VAR)
-
-### Command Execution
-- ✅ Execute commands from PATH
-- ✅ Execute commands with absolute/relative paths
-- ✅ Handle command arguments
-
-### Pipes & Redirections
-- ✅ Pipes (`|`) - Chain commands together
-- ✅ Input redirection (`<`) - Read from file
-- ✅ Output redirection (`>`) - Write to file
-- ✅ Append redirection (`>>`) - Append to file
-- ✅ Here-document (`<<`) - Read until delimiter
-
-### Quoting
-- ✅ Single quotes (`'`) - Prevent interpretation
-- ✅ Double quotes (`"`) - Allow variable expansion
+| Category | Tools / Technologies |
+| :--- | :--- |
+| **Language / Standard** | C (C99 — uses `<stdbool.h>`), POSIX.1-2001 system calls |
+| **System Primitives** | `fork`, `execve`, `waitpid`, `pipe`, `dup2`, `sigaction`, `open`/`close`, `chdir`/`getcwd` |
+| **External Libraries** | GNU `readline` (line editing, history), `termcap` |
+| **Compiler & Flags** | `cc` (gcc/clang) with `-Wall -Wextra -Werror -Wno-unused-function -g3` |
+| **Build System** | GNU Make (recursive build into `libft/`) |
 
 ---
 
-## 🚀 Installation
+## 🚀 Getting Started
 
 ### Prerequisites
+- Linux or macOS with a C compiler (`gcc`/`clang`) and GNU Make.
+- GNU `readline` + `termcap` development headers.
+  - macOS (Homebrew): `brew install readline` — the top-level [Makefile](Makefile) links against the Intel Homebrew prefix `/usr/local/opt/readline` explicitly; on Apple Silicon (`/opt/homebrew`) or Linux, adjust `-I`/`-L` in the `Makefile` link rule accordingly.
+  - Debian/Ubuntu: `sudo apt-get install build-essential libreadline-dev`
 
-Ensure you have the following installed:
-- GCC or Clang compiler
-- GNU Make
-- GNU Readline library
-- Termcap library
-
-**On Debian/Ubuntu:**
-```bash
-sudo apt-get update
-sudo apt-get install build-essential libreadline-dev
-```
-
-**On macOS (with Homebrew):**
-```bash
-brew install readline
-```
-
-### Build
-
-1. **Clone the repository:**
-```bash
-git clone https://github.com/h-claude/minishell.git
-cd minishell
-```
-
-2. **Compile the project:**
+### Compilation
 ```bash
 make
 ```
 
-3. **Clean object files:**
-```bash
-make clean
-```
-
-4. **Full clean (remove executable):**
-```bash
-make fclean
-```
-
-5. **Rebuild:**
-```bash
-make re
-```
-
----
-
-## 💻 Usage
-
-### Starting the Shell
-
+### Usage
 ```bash
 ./minishell
 ```
-
-You will see an interactive prompt:
+Drops into an interactive prompt reflecting the current directory:
 ```
-DEDSEC ❋ /current/directory$ > 
+DEDSEC ❋ /current/directory$ >
 ```
 
-### Example Commands
-
+*Example:*
 ```bash
-# Simple command
-DEDSEC ❋ ~$ > ls -la
-
-# Environment variables
-DEDSEC ❋ ~$ > echo $HOME
-
-# Pipes
-DEDSEC ❋ ~$ > ls -la | grep minishell | wc -l
-
-# Redirections
-DEDSEC ❋ ~$ > echo "Hello World" > output.txt
-DEDSEC ❋ ~$ > cat < input.txt
-
-# Append redirection
-DEDSEC ❋ ~$ > echo "New line" >> output.txt
-
-# Here-document
-DEDSEC ❋ ~$ > cat << EOF
-> Line 1
-> Line 2
+DEDSEC ❋ ~$ > echo "$HOME" | grep -i user | wc -l
+DEDSEC ❋ ~$ > cat << EOF > out.txt
+> hello $USER
 > EOF
-
-# Chaining with pipes and redirections
-DEDSEC ❋ ~$ > cat file.txt | grep pattern | sort > sorted.txt
+DEDSEC ❋ ~$ > cd - && pwd
 ```
 
----
-
-## 🔧 Built-in Commands
-
-| Command | Description | Usage |
-|---------|-------------|-------|
-| `echo` | Display text | `echo [-n] [string...]` |
-| `cd` | Change directory | `cd [path]` |
-| `pwd` | Print working directory | `pwd` |
-| `export` | Set environment variable | `export [name=value]` |
-| `unset` | Remove environment variable | `unset [name]` |
-| `env` | Display environment variables | `env` |
-| `exit` | Exit the shell | `exit [status]` |
+### Build Targets
+- `make`: Compiles `libft` then the `minishell` binary.
+- `make clean`: Removes intermediate object files (`.objs/`, `libft`'s own objects).
+- `make fclean`: Runs `clean` and additionally removes the compiled `minishell` binary.
+- `make re`: Equivalent to `fclean` followed by `all`.
 
 ---
 
-## 📁 Project Structure
+## 🧪 Testing & Reliability Verification
 
-```
-minishell/
-├── Makefile                    # Build configuration
-├── README.md                   # This file
-├── includes/
-│   └── minishell.h             # Main header file
-├── libft/                      # Custom C library
-│   ├── Makefile
-│   ├── libft.h
-│   ├── ft_*.c                  # Standard library reimplementations
-│   ├── get_next_line.c         # File reading function
-│   └── garbage_collector/      # Memory management
-│       ├── garbage_collector.c
-│       └── call_functions.c
-└── srcs/
-    ├── builtins/               # Built-in command implementations
-    │   ├── cd/
-    │   │   ├── cd.c
-    │   │   ├── cd_utils.c
-    │   │   └── cd_utils_env.c
-    │   ├── echo.c
-    │   ├── env.c
-    │   ├── exit.c
-    │   ├── export.c
-    │   ├── pwd.c
-    │   └── unset.c
-    ├── execution/              # Command execution
-    │   ├── exec.c
-    │   ├── exec_utils.c
-    │   ├── redirect.c
-    │   ├── utils.c
-    │   └── exec_pipe/          # Pipe handling
-    │       ├── exec_pipe.c
-    │       ├── manage_pid.c
-    │       ├── ast_to_list.c
-    │       ├── redirection_pipe.c
-    │       └── utils_for_pipe.c
-    ├── parsing/                # Lexer and Parser
-    │   ├── main.c              # Entry point
-    │   ├── lexer.c             # Tokenization
-    │   ├── lexer_utils.c
-    │   ├── parser.c            # AST generation
-    │   ├── parsecmd.c
-    │   ├── vars.c              # Variable expansion
-    │   └── utils.c
-    └── utils/                  # Utility functions
-        ├── utils.c
-        ├── utils2.c
-        ├── copy_env.c
-        ├── signals.c
-        └── print_errors.c
+The repository ships no automated test harness; the checks below are the manual verification commands the implementation is designed to pass.
+
+### Memory Leak & Concurrency Checks
+```bash
+# Verify zero memory leaks (each ft_exit() path frees the garbage-collector list)
+valgrind --leak-check=full --show-leak-kinds=all --trace-children=yes ./minishell
+
+# Confirm signal handling under interactive use
+./minishell
+# then press Ctrl-C (SIGINT) at the prompt, Ctrl-\ (SIGQUIT), and Ctrl-D (EOF)
 ```
 
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        User Input                           │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     Readline Library                        │
-│              (Command editing & history)                    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                         Lexer                               │
-│        (Tokenize input into words, operators, etc.)         │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                        Parser                               │
-│           (Build Abstract Syntax Tree - AST)                │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                       Executor                              │
-│    (Execute commands, handle pipes & redirections)          │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                        Output                               │
-└─────────────────────────────────────────────────────────────┘
-```
+- [x] All allocations tracked through `ft_malloc`/`ft_free`/`ft_free_gb`, released on every `ft_exit()` path.
+- [x] `ft_exit()` closes file descriptors `0`–`1023` unconditionally before terminating.
+- [x] `SIGINT` at the prompt redraws the line and sets `$?` to `1`; inside a heredoc it aborts collection; during child execution it falls back to default behavior.
+- [x] `SIGQUIT` (`Ctrl-\`) prints `Quit: 3` and sets exit status `131`, mirroring bash.
+- [x] `exit` builtin validates numeric arguments (rejects non-digit input, "too many arguments"), and wraps values `> 255` modulo `256`.
+- [x] Command lookup distinguishes "command not found" (127) from "permission denied" (126), matching POSIX shell exit-status conventions.
 
 ---
 
-## 👥 Authors
+## 👤 Author
 
-| Author | GitHub |
-|--------|--------|
-| **Hippolyte Claude** | [@h-claude](https://github.com/h-claude) |
-| **Mohamed Ali Ajili** | [@moajili](https://github.com/ajilidali) |
-
----
-
-## 📝 License
-
-This project is part of the 42 School curriculum.
-
----
-
-## 🙏 Acknowledgments
-
-- [42 School](https://42.fr/) for the project subject
-- [GNU Readline](https://tiswww.case.edu/php/chet/readline/rltop.html) documentation
-- [Bash Reference Manual](https://www.gnu.org/software/bash/manual/bash.html)
-
----
+- **Hippolyte Claude** — [@h-claude](https://github.com/h-claude)
+- **Mohamed Ali Ajili** — [@ajilidali](https://github.com/ajilidali)
