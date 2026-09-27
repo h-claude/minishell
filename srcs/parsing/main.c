@@ -67,12 +67,12 @@ char	*rl_shell(char *line_read)
 	}
 	prompt = make_prompt();
 	if (!prompt)
-		return (rl_clear_history(), ft_exit(EXIT_FAILURE), NULL);
+		return (clear_history(), ft_exit(EXIT_FAILURE), NULL);
 	line_read = readline(prompt);
 	if (line_read == NULL)
 	{
 		ft_free(prompt);
-		rl_clear_history();
+		clear_history();
 		ft_free_gb();
 		ft_putstr_fd("exit\n", STDOUT_FILENO);
 		ft_exit(EXIT_SUCCESS);

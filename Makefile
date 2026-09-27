@@ -15,6 +15,13 @@ CC 		= @cc
 INCLUDE = -I./includes
 CFLAGS 	= -Wall -Wextra -Werror -Wno-unused-function -g3
 
+UNAME_S	:= $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+READLINE_PREFIX	:= $(shell brew --prefix readline 2>/dev/null || echo /usr/local/opt/readline)
+INCLUDE	+= -I$(READLINE_PREFIX)/include
+READLINE_LIBS	= -L$(READLINE_PREFIX)/lib
+endif
+
 OBJDIR= .objs
 
 SRCS	= srcs/parsing/main.c srcs/parsing/lexer.c srcs/parsing/lexer_utils.c srcs/parsing/utils.c srcs/parsing/vars.c srcs/parsing/parser.c \
@@ -34,7 +41,7 @@ $(OBJDIR)/%.o: %.c
 
 ${NAME}: ${OBJS}
 	@make -s -C ./libft
-	@$(CC) ${OBJS} -Llibft -lft $(INCLUDE) -lreadline -ltermcap -I/usr/local/opt/readline/include -L/usr/local/opt/readline/lib -o ${NAME} ${CFLAGS}
+	@$(CC) ${OBJS} -Llibft -lft $(INCLUDE) $(READLINE_LIBS) -lreadline -ltermcap -o ${NAME} ${CFLAGS}
 	@echo "\033[32mminishell compiled\033[0m"
 
 clean:

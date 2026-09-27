@@ -40,7 +40,7 @@ int	run_exit(char **command, t_ms *mini)
 	int	exit_value;
 
 	exit_value = mini->exit_code;
-	rl_clear_history();
+	clear_history();
 	if (!command[1])
 		return (free_env(give_envp(NULL, 0)), ft_exit(exit_value), exit_value);
 	if (command[2])
